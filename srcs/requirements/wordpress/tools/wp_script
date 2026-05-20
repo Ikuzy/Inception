@@ -1,0 +1,185 @@
+#!/bin/sh
+set -e
+
+echo "=========================================="
+echo "     WordPress Installation"
+echo "=========================================="
+
+read_secret() {
+    secret_file="$1"
+    if [ -f "$secret_file" ] && [ -s "$secret_file" ]; then
+        cat "$secret_file" | tr -d '\n'
+    else
+        echo "[ERROR] Secret file '$secret_file' not found or empty" >&2
+        exit 1
+    fi
+}
+
+echo "[INFO] Validating environment variables..."
+if [ -z "$MAIN_NAME" ]; then
+    echo "[ERROR] MAIN_NAME not set"
+    exit 1
+fi
+if [ -z "$MYSQL_USER" ]; then
+    echo "[ERROR] MYSQL_USER not set"
+    exit 1
+fi
+if [ -z "$WP_ADMIN_USER" ]; then
+    echo "[ERROR] WP_ADMIN_USER not set"
+    exit 1
+fi
+if [ -z "$MYSQL_DATABASE" ]; then
+    echo "[ERROR] MYSQL_DATABASE not set"
+    exit 1
+fi
+if [ -z "$WP_ADMIN_EMAIL" ]; then
+    echo "[ERROR] WP_ADMIN_EMAIL not set"
+    exit 1
+fi
+
+if echo "$WP_ADMIN_USER" | grep -qi "admin"; then
+    echo "[ERROR] Admin username '$WP_ADMIN_USER' cannot contain 'admin'"
+    exit 1
+fi
+
+echo "[INFO] Loading secrets..."
+DB_PASSWORD=$(read_secret "/run/secrets/db_password")
+ADMIN_PASSWORD=$(read_secret "/run/secrets/credentials")
+echo "🔐 Secrets loaded successfully"
+
+echo "[INFO] Setting up directory permissions..."
+mkdir -p /var/www/html
+chown -R www-data:www-data /var/www/html
+
+# Check Redis for session storage
+echo "[INFO] Checking Redis connection..."
+REDIS_RETRIES=20
+REDIS_COUNT=0
+while [ $REDIS_COUNT -lt $REDIS_RETRIES ]; do
+    if redis-cli -h redis -p 6379 ping 2>/dev/null | grep -q "PONG"; then
+        echo "✅ Redis ready (sessions will use Redis)"
+        REDIS_AVAILABLE=true
+        break
+    fi
+    REDIS_COUNT=$((REDIS_COUNT + 1))
+    echo "   Redis attempt $REDIS_COUNT/$REDIS_RETRIES"
+    sleep 2
+done
+
+if [ $REDIS_COUNT -eq $REDIS_RETRIES ]; then
+    echo "[WARNING] Redis not ready, sessions will use files"
+    REDIS_AVAILABLE=false
+fi
+
+echo "[INFO] Waiting for MariaDB..."
+MAX_RETRIES=30
+COUNT=0
+while [ $COUNT -lt $MAX_RETRIES ]; do
+    if mariadb-admin ping \
+        --host="mariadb" \
+        --user="$MYSQL_USER" \
+        --password="$DB_PASSWORD" \
+        --silent 2>/dev/null; then
+        echo "✅ MariaDB ready"
+        break
+    fi
+    COUNT=$((COUNT + 1))
+    echo "   Attempt $COUNT/$MAX_RETRIES"
+    sleep 2
+done
+
+if [ $COUNT -eq $MAX_RETRIES ]; then
+    echo "[ERROR] MariaDB not ready"
+    exit 1
+fi
+
+echo "[INFO] Checking WordPress installation..."
+if wp core is-installed --allow-root --path=/var/www/html 2>/dev/null; then
+    echo "[NOTICE] WordPress is already installed"
+    
+    if wp db check --allow-root --path=/var/www/html 2>/dev/null; then
+        echo "[SUCCESS] Database connection OK"
+    else
+        echo "[WARNING] Database issue, attempting repair..."
+        wp db repair --allow-root --path=/var/www/html 2>/dev/null || true
+    fi
+    
+else
+    echo "[INFO] Installing WordPress..."
+    
+    if [ !  -f "/var/www/html/wp-config.php" ] && [ ! -f "/var/www/html/wp-login.php" ]; then
+        echo "[INFO] Downloading WordPress..."
+        wp core download --path=/var/www/html --allow-root --locale=en_US
+        echo "[SUCCESS] WordPress downloaded"
+    fi
+    
+    if [ !  -f "/var/www/html/wp-config.php" ]; then
+        echo "[INFO] Creating wp-config.php..."
+        wp config create \
+            --dbname="$MYSQL_DATABASE" \
+            --dbuser="$MYSQL_USER" \
+            --dbpass="$DB_PASSWORD" \
+            --dbhost="mariadb" \
+            --allow-root \
+            --path=/var/www/html \
+            --skip-check
+        
+        wp config set WP_HOME "https://$MAIN_NAME" --type=constant --allow-root --path=/var/www/html
+        wp config set WP_SITEURL "https://$MAIN_NAME" --type=constant --allow-root --path=/var/www/html
+        wp config set FS_METHOD "direct" --type=constant --allow-root --path=/var/www/html
+        
+        echo "[SUCCESS] wp-config.php created"
+    fi
+    
+    echo "[INFO] Installing WordPress core..."
+    wp core install \
+        --url="https://$MAIN_NAME" \
+        --title="Inception Project" \
+        --admin_user="$WP_ADMIN_USER" \
+        --admin_password="$ADMIN_PASSWORD" \
+        --admin_email="$WP_ADMIN_EMAIL" \
+        --path=/var/www/html \
+        --allow-root
+    
+    echo "[SUCCESS] WordPress installed"
+    
+    echo "[INFO] Creating second user..."
+    EDITOR_PASSWORD="Editor_$(date +%s | tail -c 6)"
+    if !  wp user get editor --path=/var/www/html --allow-root 2>/dev/null; then
+        wp user create \
+            editor \
+            "editor@$MAIN_NAME" \
+            --role=editor \
+            --user_pass="$EDITOR_PASSWORD" \
+            --path=/var/www/html \
+            --allow-root
+        echo "[SUCCESS] Editor user created (password: $EDITOR_PASSWORD)"
+    fi
+    
+    echo "[SUCCESS] WordPress installation complete!"
+    echo "   Site:  https://$MAIN_NAME"
+    echo "   Admin: $WP_ADMIN_USER"
+fi
+
+if [ "$REDIS_AVAILABLE" = "true" ]; then
+    echo "[INFO] Verifying Redis session storage..."
+    php -r "
+        \$redis = new Redis();
+        if (\$redis->connect('redis', 6379)) {
+            \$redis->set('test_session', 'ok');
+            if (\$redis->get('test_session') === 'ok') {
+                \$redis->del('test_session');
+                echo '✅ Redis sessions:  Working' . PHP_EOL;
+            }
+        }
+    " 2>/dev/null || echo "[WARNING] Redis test failed"
+fi
+
+echo "[INFO] Setting file permissions..."
+chown -R www-data:www-data /var/www/html
+find /var/www/html -type d -exec chmod 755 {} \;
+find /var/www/html -type f -exec chmod 644 {} \;
+chmod -R 775 /var/www/html/wp-content 2>/dev/null || true
+
+echo "[INFO] Starting php-fpm..."
+exec php-fpm83 -F -R

@@ -1,0 +1,104 @@
+#!/bin/sh
+set -e
+
+echo "=========================================="
+echo "     MariaDB Initialization"
+echo "=========================================="
+
+read_secret() {
+    secret_file="$1"
+    if [ -f "$secret_file" ] && [ -s "$secret_file" ]; then
+        cat "$secret_file" | tr -d '\n'
+    else
+        echo "[ERROR] Secret file '$secret_file' not found or empty" >&2
+        exit 1
+    fi
+}
+
+echo "[INFO] Loading secrets..."
+if [ -f "/run/secrets/db_root_password" ]; then
+    MYSQL_ROOT_PASSWORD=$(read_secret "/run/secrets/db_root_password")
+    echo "  ✓ Root password loaded"
+else
+    echo "[ERROR] No root password secret found" >&2
+    exit 1
+fi
+
+if [ -f "/run/secrets/db_password" ]; then
+    MYSQL_PASSWORD=$(read_secret "/run/secrets/db_password")
+    echo "  ✓ User password loaded"
+else
+    echo "[ERROR] No user password secret found" >&2
+    exit 1
+fi
+
+if [ ! -d "/var/lib/mysql/mysql" ]; then
+    echo "[INFO] First-time database setup"
+    
+    echo "  → Installing system tables..."
+    mariadb-install-db --user=mysql --datadir=/var/lib/mysql --skip-test-db --rpm 2>/dev/null
+    
+    echo "  → Starting temporary MariaDB..."
+    mariadbd --user=mysql &
+    MYSQL_PID=$!
+    
+    echo "  → Waiting for server..."
+    counter=0
+    while [ $counter -lt 30 ]; do
+        if mariadb-admin ping --silent 2>/dev/null; then
+            echo "  ✓ Connected (${counter}s)"
+            break
+        fi
+        sleep 1
+        counter=$((counter + 1))
+    done
+    
+    if [ $counter -eq 30 ]; then
+        echo "[ERROR] MariaDB failed to start within 30 seconds"
+        kill $MYSQL_PID 2>/dev/null || true
+        exit 1
+    fi
+    
+    echo "  → Securing installation..."
+    mariadb << EOF
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD//\'/\\\'}';
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+FLUSH PRIVILEGES;
+EOF
+    
+    if [ -n "$MYSQL_DATABASE" ]; then
+        echo "  → Creating database: $MYSQL_DATABASE"
+        mariadb -u root -p"${MYSQL_ROOT_PASSWORD}" \
+            -e "CREATE DATABASE IF NOT EXISTS \`$MYSQL_DATABASE\`;"
+    fi
+    
+    if [ -n "$MYSQL_USER" ] && [ -n "$MYSQL_PASSWORD" ]; then
+        echo "  → Creating user: $MYSQL_USER"
+        mariadb -u root -p"${MYSQL_ROOT_PASSWORD}" \
+            -e "CREATE USER IF NOT EXISTS '$MYSQL_USER'@'%' IDENTIFIED BY '$MYSQL_PASSWORD';"
+        
+        if [ -n "$MYSQL_DATABASE" ]; then
+            echo "  → Granting privileges..."
+            mariadb -u root -p"${MYSQL_ROOT_PASSWORD}" \
+                -e "GRANT ALL PRIVILEGES ON \`$MYSQL_DATABASE\`.* TO '$MYSQL_USER'@'%';"
+            mariadb -u root -p"${MYSQL_ROOT_PASSWORD}" \
+                -e "FLUSH PRIVILEGES;"
+        fi
+    fi
+    
+    echo "  → Stopping temporary instance..."
+    mariadb-admin -u root -p"${MYSQL_ROOT_PASSWORD}" shutdown 2>/dev/null
+    wait $MYSQL_PID 2>/dev/null || true
+    
+    echo "[INFO] Database initialized successfully"
+else
+    echo "[INFO] Using existing database"
+fi
+
+echo "=========================================="
+echo "[INFO] Starting MariaDB server..."
+echo "=========================================="
+
+exec mariadbd --user=mysql

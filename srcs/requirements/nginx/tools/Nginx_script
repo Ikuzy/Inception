@@ -1,0 +1,85 @@
+#!/bin/sh
+set -e
+
+echo "=========================================="
+echo "     NGINX  Setup"
+echo "=========================================="
+
+read_secret() {
+    secret_file="$1"
+    if [ -f "$secret_file" ] && [ -s "$secret_file" ]; then
+        cat "$secret_file" | tr -d '\n'
+    else
+        echo "[ERROR] Secret file '$secret_file' not found or empty" >&2
+        exit 1
+    fi
+}
+
+if ! command -v nginx >/dev/null 2>&1; then
+    echo "[ERROR] nginx command not found" >&2
+    exit 1
+fi
+
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "[ERROR] openssl command not found" >&2
+    exit 1
+fi
+
+echo "[INFO] SSL Certificate Configuration"
+
+if [ ! -f "/etc/nginx/ssl/nginx-selfsigned.crt" ]; then
+    echo "🔐 Generating new SSL certificate for ${MAIN_NAME}..."
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/nginx/ssl/nginx-selfsigned.key \
+        -out /etc/nginx/ssl/nginx-selfsigned.crt \
+        -subj "/C=MA/ST=Casablanca/L=Casablanca/O=42/CN=${MAIN_NAME}"
+else
+    echo "[INFO] Using existing SSL certificate..."
+fi
+
+echo "[INFO] Waiting for WordPress backend..."
+
+MAX_RETRIES=30
+RETRY_COUNT=0
+
+while [ ${RETRY_COUNT} -lt ${MAX_RETRIES} ]; do
+    if nc -z wordpress 9000 2>/dev/null; then
+        echo "[SUCCESS] WordPress backend ready"
+        break
+    fi
+    
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    echo "[INFO] Still waiting... (${RETRY_COUNT}/${MAX_RETRIES})"
+
+    sleep 2
+done
+
+if [ ${RETRY_COUNT} -eq ${MAX_RETRIES} ]; then
+    echo "[ERROR] WordPress backend not ready."
+    exit 1
+fi
+
+echo "[INFO] Validating NGINX configuration..."
+
+if nginx -t >/dev/null 2>&1; then
+    echo "[SUCCESS] Configuration test passed"
+else
+    echo "[ERROR] Configuration test failed" >&2
+    nginx -t
+    exit 1
+fi
+
+if [ -f "/run/nginx/nginx.pid" ]; then
+    echo "[INFO] Stopping previous NGINX instance..."
+    nginx -s stop 2>/dev/null || true
+    sleep 2
+fi
+
+ADMINER_PASSWORD=$(read_secret "/run/secrets/ad_password")
+echo ADMINER_PASSWORD > /etc/nginx/.passwd-adminer
+
+echo "=========================================="
+echo "[INFO] Starting NGINX server..."
+echo "=========================================="
+
+exec nginx -g "daemon off;"

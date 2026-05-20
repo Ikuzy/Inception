@@ -1,0 +1,19 @@
+[mysqld]
+socket = /run/mysqld/mysqld.sock
+port = 3306
+bind-address = 0.0.0.0
+
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+
+skip-name-resolve
+
+innodb_buffer_pool_size = 128M
+innodb_log_file_size = 48M
+
+log_error = /var/log/mysql/error.log
+log_warnings = 2
+
+[client]
+default-character-set = utf8mb4
+socket = /run/mysqld/mysqld.sock

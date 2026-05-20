@@ -1,0 +1,123 @@
+#!/bin/sh
+set -e
+
+echo "=========================================="
+echo "     FTP Server Setup - UID/GID Fix"
+echo "=========================================="
+
+read_secret() {
+    secret_file="$1"
+    if [ -f "$secret_file" ] && [ -s "$secret_file" ]; then
+        cat "$secret_file" | tr -d '\n'
+    else
+        echo "[ERROR] Secret file '$secret_file' not found or empty" >&2
+        exit 1
+    fi
+}
+
+echo "[INFO] Loading secrets..."
+FTP_PASSWORD=$(read_secret "/run/secrets/vsftp_password")
+echo "[SUCCESS] Secrets loaded successfully"
+
+# Create www-data group and user with matching UID/GID from WordPress
+echo "[INFO] Creating www-data user with UID=33 GID=33 (matching WordPress)"
+
+# Create group first
+if ! getent group www-data >/dev/null 2>&1; then
+    addgroup -g 33 www-data
+    echo "[SUCCESS] Created www-data group (GID=33)"
+else
+    echo "[NOTICE] www-data group already exists"
+fi
+
+# Create user
+if ! id www-data >/dev/null 2>&1; then
+    adduser -D -u 33 -G www-data -h /var/www/html -s /bin/sh www-data
+    echo "[SUCCESS] Created www-data user (UID=33)"
+else
+    echo "[NOTICE] www-data user already exists"
+    # Ensure correct UID/GID even if user exists
+    usermod -u 33 www-data 2>/dev/null || true
+    usermod -g 33 www-data 2>/dev/null || true
+fi
+
+echo "[INFO] Setting FTP password for www-data..."
+echo "www-data:${FTP_PASSWORD}" | chpasswd
+echo "[SUCCESS] FTP credentials configured for www-data"
+
+# Create required directories
+mkdir -p /var/run/vsftpd/empty
+mkdir -p /var/log
+mkdir -p /var/www/html
+
+# Set ownership to www-data (UID=33)
+echo "[INFO] Setting ownership to www-data (UID=33, GID=33)..."
+chown -R www-data:www-data /var/www/html
+
+# Set proper permissions
+echo "[INFO] Setting permissions..."
+find /var/www/html -type d -exec chmod 755 {} \; 2>/dev/null || true
+find /var/www/html -type f -exec chmod 644 {} \; 2>/dev/null || true
+
+# Make wp-content writable
+if [ -d /var/www/html/wp-content ]; then
+    chmod -R 775 /var/www/html/wp-content
+    chown -R www-data:www-data /var/www/html/wp-content
+    echo "[SUCCESS] wp-content configured with write permissions"
+fi
+
+echo "[INFO] Final ownership check:"
+ls -la /var/www/html/ | head -10
+
+echo "[SUCCESS] Setup complete. Starting vsftpd..."
+
+# Check if config exists
+if [ ! -f /etc/vsftpd/vsftpd.conf ]; then
+    echo "[ERROR] vsftpd.conf not found!"
+    exit 1
+fi
+
+# Ensure vsftpd runs in foreground mode
+if ! grep -q "^background=NO" /etc/vsftpd/vsftpd.conf; then
+    echo "[INFO] Adding background=NO to config..."
+    echo "background=NO" >> /etc/vsftpd/vsftpd.conf
+fi
+
+# Enable local users and disable anonymous
+if ! grep -q "^local_enable=YES" /etc/vsftpd/vsftpd.conf; then
+    echo "local_enable=YES" >> /etc/vsftpd/vsftpd.conf
+fi
+
+if ! grep -q "^write_enable=YES" /etc/vsftpd/vsftpd.conf; then
+    echo "write_enable=YES" >> /etc/vsftpd/vsftpd.conf
+fi
+
+# Create PAM config if missing
+if [ ! -f /etc/pam.d/vsftpd ]; then
+    echo "[INFO] Creating PAM config..."
+    mkdir -p /etc/pam.d
+    cat > /etc/pam.d/vsftpd << 'EOF'
+auth required pam_unix.so
+account required pam_unix.so
+session required pam_unix.so
+EOF
+fi
+
+# Verify user exists and has password
+echo "[INFO] Verifying www-data user..."
+if ! getent passwd www-data > /dev/null; then
+    echo "[ERROR] www-data user does not exist!"
+    exit 1
+fi
+
+# Test user can authenticate
+echo "[INFO] Testing user shell access..."
+su -s /bin/sh www-data -c "echo 'User shell OK'" || echo "[WARN] Shell test failed"
+
+# Show final config
+echo "[INFO] Active vsftpd configuration:"
+grep -v "^#" /etc/vsftpd/vsftpd.conf | grep -v "^$" | head -20
+
+echo "[INFO] Starting vsftpd in foreground mode..."
+exec vsftpd /etc/vsftpd/vsftpd.conf
+
